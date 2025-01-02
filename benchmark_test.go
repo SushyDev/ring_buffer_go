@@ -1,7 +1,6 @@
 package ring_buffer_go
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -70,7 +69,7 @@ func BenchmarkLockingRingBuffer(b *testing.B) {
 	const dataSize = 1024
 	const bufferSize = 1 << 30
 
-	buffer := NewLockingRingBuffer(context.Background(), bufferSize, 0)
+	buffer := NewLockingRingBuffer(bufferSize, 0)
 
 	// Benchmark the ring buffer
 	benchmarkLockingRingBuffer(buffer, iterations, dataSize)

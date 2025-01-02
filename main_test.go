@@ -9,7 +9,7 @@ import (
 func TestLockingRingBuffer(t *testing.T) {
     // Helper function to create a new buffer
     newBuffer := func(size uint64, startPosition uint64) *LockingRingBuffer {
-        return NewLockingRingBuffer(context.Background(), size, startPosition)
+        return NewLockingRingBuffer(size, startPosition)
     }
 
     // Test: Basic Write and Read
@@ -134,9 +134,9 @@ func TestLockingRingBuffer(t *testing.T) {
             buffer.Write([]byte("d"))
         }()
 
-        buffer.WaitForPositionInBuffer(3)
+        buffer.WaitForPosition(3, 3 * time.Second)
 
-        if !buffer.IsPositionInBuffer(3) {
+        if !buffer.IsPositionAvailable(3) {
             t.Fatalf("expected position 3 to be in buffer")
         }
     })
@@ -178,23 +178,6 @@ func TestLockingRingBuffer(t *testing.T) {
         n, err = buffer.ReadAt(readBuf, 6)
         if err == nil || n != 0 {
             t.Fatalf("expected error for out of bounds read, read %d, error: %v", n, err)
-        }
-    })
-
-    // Test: Context Cancellation
-    t.Run("Context Cancellation", func(t *testing.T) {
-        ctx, cancel := context.WithCancel(context.Background())
-        buffer := NewLockingRingBuffer(ctx, 5, 0)
-
-        go func() {
-            time.Sleep(50 * time.Millisecond)
-            cancel()
-        }()
-
-        buffer.WaitForPositionInBuffer(5)
-
-        if buffer.IsPositionInBuffer(5) {
-            t.Fatalf("expected position 5 not to be in buffer after context cancellation")
         }
     })
 }

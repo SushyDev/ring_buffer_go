@@ -1,7 +1,6 @@
 package ring_buffer_go
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -26,10 +25,10 @@ type LockingRingBufferInterface interface {
 	GetBytesToOverwrite() uint64
 
 	// Calculates if the given absolute position is in the buffer.
-	IsPositionInBuffer(absolutePosition uint64) bool
+	IsPositionAvailable(absolutePosition uint64) bool
 
 	// Waits until the given absolute position is in the buffer.
-	WaitForPositionInBuffer(absolutePosition uint64)
+	WaitForPosition(absolutePosition uint64, maxWait time.Duration) bool
 
 	// Resets the buffer to the given absolute position.
 	ResetToPosition(absolutePosition uint64)
@@ -49,13 +48,12 @@ type LockingRingBuffer struct {
 	readPage  atomic.Uint64
 	writePage atomic.Uint64
 
-	ctx context.Context
+	closed atomic.Bool
 }
 
-func NewLockingRingBuffer(ctx context.Context, size uint64, startPosition uint64) *LockingRingBuffer {
+func NewLockingRingBuffer(size uint64, startPosition uint64) *LockingRingBuffer {
 	buffer := &LockingRingBuffer{
 		data: make([]byte, size),
-		ctx:  ctx,
 	}
 
 	buffer.setStartPosition(startPosition)
@@ -69,7 +67,7 @@ func (buffer *LockingRingBuffer) cap() uint64 {
 
 // Reads from the buffer at the given absolute position.
 func (buffer *LockingRingBuffer) ReadAt(p []byte, absolutePosition uint64) (n int, err error) {
-	if buffer.isClosed() {
+	if buffer.closed.Load() {
 		return 0, errors.New("buffer is closed")
 	}
 
@@ -78,7 +76,7 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, absolutePosition uint64) (n in
 		return 0, errors.New("buffer is empty")
 	}
 
-	if !buffer.IsPositionInBuffer(absolutePosition) {
+	if !buffer.IsPositionAvailable(absolutePosition) {
 		return 0, fmt.Errorf("position %d is not in buffer", absolutePosition)
 	}
 
@@ -121,7 +119,7 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, absolutePosition uint64) (n in
 
 // Appends data to the buffer and returns the number of bytes written.
 func (buffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
-	if buffer.isClosed() {
+	if buffer.closed.Load() {
 		return 0, errors.New("buffer is closed")
 	}
 
@@ -171,7 +169,7 @@ func (buffer *LockingRingBuffer) getRelativePosition(absolutePosition uint64) ui
 }
 
 // Calculates if the given absolute position is in the buffer.
-func (buffer *LockingRingBuffer) IsPositionInBuffer(absolutePosition uint64) bool {
+func (buffer *LockingRingBuffer) IsPositionAvailable(absolutePosition uint64) bool {
 	relativePosition := buffer.getRelativePosition(absolutePosition)
 	if relativePosition < 0 {
 		return false
@@ -215,15 +213,18 @@ func (buffer *LockingRingBuffer) IsPositionInBuffer(absolutePosition uint64) boo
 }
 
 // Waits until the given absolute position is in the buffer.
-func (buffer *LockingRingBuffer) WaitForPositionInBuffer(absolutePosition uint64) {
+func (buffer *LockingRingBuffer) WaitForPosition(absolutePosition uint64, maxWait time.Duration) bool {
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+
 	for {
-		if buffer.IsPositionInBuffer(absolutePosition) {
-			return
+		if buffer.IsPositionAvailable(absolutePosition) {
+			return true
 		}
 
 		select {
-		case <-buffer.ctx.Done():
-			return
+		case <-timer.C:
+			return false
 		case <-time.After(100 * time.Microsecond):
 		}
 	}
@@ -248,11 +249,6 @@ func (buffer *LockingRingBuffer) ResetToPosition(absolutePosition uint64) {
 	buffer.data = make([]byte, buffer.cap())
 }
 
-func (buffer *LockingRingBuffer) isClosed() bool {
-	select {
-	case <-buffer.ctx.Done():
-		return true
-	default:
-		return false
-	}
+func (buffer *LockingRingBuffer) Close() {
+	buffer.closed.Store(true)
 }
