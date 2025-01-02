@@ -1,4 +1,4 @@
-package ring_buffer
+package ring_buffer_go
 
 import (
 	"context"
