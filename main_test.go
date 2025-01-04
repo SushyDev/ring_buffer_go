@@ -134,7 +134,10 @@ func TestLockingRingBuffer(t *testing.T) {
             buffer.Write([]byte("d"))
         }()
 
-        buffer.WaitForPosition(3, 3 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+        buffer.WaitForPosition(ctx, 3)
 
         if !buffer.IsPositionAvailable(3) {
             t.Fatalf("expected position 3 to be in buffer")
@@ -176,6 +179,7 @@ func TestLockingRingBuffer(t *testing.T) {
 
         readBuf := make([]byte, 5)
         n, err = buffer.ReadAt(readBuf, 6)
+
         if err == nil || n != 0 {
             t.Fatalf("expected error for out of bounds read, read %d, error: %v", n, err)
         }
