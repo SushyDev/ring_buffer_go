@@ -4,244 +4,195 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// LockingRingBufferInterface is an interface for a locking ring buffer.
-// Features:
-// - Fixed size buffer.
-// - Unread data cannot be overwritten.
-// - Read from absolute position.
-// - Absolute positions get checked if they are in the buffer.
-
 type LockingRingBufferInterface interface {
-	// Returns the buffer size.
-	Size() uint64
-
 	// Reads from the buffer at the given absolute position.
-	ReadAt(p []byte, absolutePosition uint64) (n int, err error)
+	ReadAt(p []byte, position int64) (n int, err error)
 
 	// Appends data to the buffer and returns the number of bytes written.
 	Write(p []byte) (n int, err error)
 
 	// Returns the number of bytes that can be written to the buffer without overwriting any data.
-	GetBytesToOverwrite() uint64
+	GetBytesToOverwrite() int64
 
 	// Calculates if the given absolute position is in the buffer.
-	IsPositionAvailable(absolutePosition uint64) bool
+	IsPositionAvailable(position int64) bool
 
 	// Waits until the given absolute position is in the buffer.
-	WaitForPosition(ctx context.Context, absolutePosition uint64) bool
+	WaitForPosition(ctx context.Context, position int64) bool
 
 	// Resets the buffer to the given absolute position.
-	ResetToPosition(absolutePosition uint64)
+	ResetToPosition(position int64)
 
 	// Closes the buffer.
-	Close()
+	Close() error
 }
 
 var _ LockingRingBufferInterface = &LockingRingBuffer{}
+var _ io.WriteCloser = &LockingRingBuffer{}
+var _ io.ReaderAt = &LockingRingBuffer{}
 
 type LockingRingBuffer struct {
 	data          []byte
-	startPosition atomic.Uint64
+	startPosition int64
 
-	lastReadPosition  atomic.Uint64
-	lastWritePosition atomic.Uint64
+	lastReadPosition  int64 // Stores normalized position (page * cap + position)
+	lastWritePosition int64 // Stores normalized position (page * cap + position)
 
-	count atomic.Uint64
-
-	readPage  atomic.Uint64
-	writePage atomic.Uint64
-
-	mu sync.Mutex
-
+	count  int64
+	mu     sync.Mutex
 	closed atomic.Bool
 }
 
-func NewLockingRingBuffer(size uint64, startPosition uint64) *LockingRingBuffer {
-	buffer := &LockingRingBuffer{
-		data: make([]byte, size),
+func NewLockingRingBuffer(size int64, startPosition int64) *LockingRingBuffer {
+	return &LockingRingBuffer{
+		data:          make([]byte, size),
+		startPosition: startPosition,
 	}
-
-	buffer.startPosition.Store(startPosition)
-
-	return buffer
 }
 
-// Returns the buffer size.
-func (buffer *LockingRingBuffer) Size() uint64 {
-	return buffer.cap()
+func (buffer *LockingRingBuffer) cap() int64 {
+	return int64(cap(buffer.data))
 }
 
-func (buffer *LockingRingBuffer) cap() uint64 {
-	return uint64(cap(buffer.data))
+func (buffer *LockingRingBuffer) getNormalizedPosition(position int64) int64 {
+	return position - buffer.startPosition
 }
 
-// Reads from the buffer at the given absolute position.
-func (buffer *LockingRingBuffer) ReadAt(p []byte, absolutePosition uint64) (n int, err error) {
+func (buffer *LockingRingBuffer) getBufferPosition(normalizedPosition int64) int64 {
+	// Handle negative positions correctly
+	cap := buffer.cap()
+	pos := normalizedPosition % cap
+	if pos < 0 {
+		pos += cap
+	}
+	return pos
+}
+
+func (buffer *LockingRingBuffer) IsPositionAvailable(position int64) bool {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 
-	if buffer.closed.Load() {
-		return 0, errors.New("buffer is closed")
+	normalizedPosition := buffer.getNormalizedPosition(position)
+	if normalizedPosition < 0 {
+		return false
 	}
 
-	bufferCount := buffer.count.Load()
-	if bufferCount <= 0 {
-		return 0, errors.New("buffer is empty")
+	if buffer.count == 0 {
+		return false
 	}
 
-	if !buffer.IsPositionAvailable(absolutePosition) {
-		return 0, fmt.Errorf("position %d is not in buffer", absolutePosition)
-	}
-
-	bufferCap := buffer.cap()
-	relativePosition := buffer.getRelativePosition(absolutePosition)
-	bufferPosition := relativePosition % bufferCap
-
-	lastReadPosition := buffer.lastReadPosition.Load()
-	lastWritePosition := buffer.lastWritePosition.Load()
-
-	requestedSize := uint64(len(p))
-
-	var readSize uint64
-	if bufferCount == bufferCap && lastReadPosition == lastWritePosition {
-		// Buffer is full and read position is at the write position, read up to the buffer capacity
-		readSize = min(requestedSize, bufferCap)
-	} else if lastWritePosition >= bufferPosition {
-		// Write position is ahead of the read position, read up to the write position
-		readSize = min(requestedSize, lastWritePosition-bufferPosition)
-	} else {
-		// Write position has wrapped around, read up to the end of the buffer and then from the start
-		readSize = min(requestedSize, bufferCap-bufferPosition+lastWritePosition)
-	}
-
-	var bytesRead int
-	if bufferPosition+readSize <= bufferCap {
-		// Read in a single contiguous block
-		bytesRead = copy(p, buffer.data[bufferPosition:bufferPosition+readSize])
-	} else {
-		// Read in two parts: from bufferPosition to end, and from start to remaining readSize
-		firstPart := bufferCap - bufferPosition
-		a := copy(p, buffer.data[bufferPosition:bufferCap])
-		b := copy(p[firstPart:], buffer.data[0:readSize-firstPart])
-
-		bytesRead = a + b
-	}
-
-	newReadPosition := (bufferPosition + uint64(bytesRead)) % bufferCap
-	if newReadPosition <= lastReadPosition {
-		buffer.readPage.Add(1)
-	}
-
-	buffer.lastReadPosition.Store(newReadPosition)
-	buffer.count.Store(bufferCount - uint64(bytesRead))
-
-	return bytesRead, nil
+	return normalizedPosition >= buffer.lastReadPosition && normalizedPosition <= buffer.lastWritePosition
 }
 
-// Appends data to the buffer and returns the number of bytes written.
 func (buffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 
 	if buffer.closed.Load() {
-		return 0, errors.New("buffer is closed")
+		return 0, context.Canceled
 	}
 
 	bufferCap := buffer.cap()
+	requestedSize := int64(len(p))
 
-	requestedSize := uint64(len(p))
 	if requestedSize > bufferCap {
-		return 0, fmt.Errorf("write data exceeds buffer size: %d", requestedSize)
+		return 0, fmt.Errorf("Write data exceeds buffer size: %d", requestedSize)
 	}
 
-	availableSpace := buffer.GetBytesToOverwrite()
-	if requestedSize > availableSpace {
-		return 0, fmt.Errorf("not enough space in buffer: %d/%d", requestedSize, availableSpace)
+	for {
+		availableSpace := buffer.GetBytesToOverwrite()
+		if requestedSize <= availableSpace {
+			break
+		}
+
+		if buffer.closed.Load() {
+			return 0, errors.New("Buffer is closed")
+		}
+
+		buffer.mu.Unlock()
+		time.Sleep(250 * time.Millisecond)
+		buffer.mu.Lock()
 	}
 
-	lastWritePosition := buffer.lastWritePosition.Load()
+	bufferWritePos := buffer.getBufferPosition(buffer.lastWritePosition)
 
 	var bytesWritten int
-	if lastWritePosition+requestedSize <= bufferCap {
-		bytesWritten = copy(buffer.data[lastWritePosition:], p)
+	if bufferWritePos+requestedSize <= bufferCap {
+		bytesWritten = copy(buffer.data[bufferWritePos:], p)
 	} else {
-		firstPart := bufferCap - lastWritePosition
-		a := copy(buffer.data[lastWritePosition:], p[:firstPart])
+		firstPart := bufferCap - bufferWritePos
+		a := copy(buffer.data[bufferWritePos:], p[:firstPart])
 		b := copy(buffer.data[0:], p[firstPart:])
-
 		bytesWritten = a + b
 	}
 
-	newWritePosition := (lastWritePosition + uint64(bytesWritten)) % bufferCap
-	if newWritePosition <= lastWritePosition {
-		buffer.writePage.Add(1)
-	}
-
-	buffer.lastWritePosition.Store(newWritePosition)
-	buffer.count.Add(uint64(bytesWritten))
+	buffer.lastWritePosition += int64(bytesWritten)
+	buffer.count += int64(bytesWritten)
 
 	return bytesWritten, nil
 }
 
-func (buffer *LockingRingBuffer) getRelativePosition(absolutePosition uint64) uint64 {
-	return absolutePosition - buffer.startPosition.Load()
-}
+func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (n int, err error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
 
-// Calculates if the given absolute position is in the locking ring buffer.
-func (buffer *LockingRingBuffer) IsPositionAvailable(absolutePosition uint64) bool {
-	relativePosition := buffer.getRelativePosition(absolutePosition)
-	if relativePosition < 0 {
-		return false
+	if buffer.closed.Load() {
+		return 0, errors.New("Buffer is closed")
 	}
 
+	if buffer.count <= 0 {
+		return 0, errors.New("Buffer is empty")
+	}
+
+	normalizedPosition := buffer.getNormalizedPosition(position)
+	if normalizedPosition < buffer.lastReadPosition || normalizedPosition > buffer.lastWritePosition {
+		return 0, fmt.Errorf("Position %d is not in buffer", position)
+	}
+
+	bufferPosition := buffer.getBufferPosition(normalizedPosition)
 	bufferCap := buffer.cap()
+	requestedSize := int64(len(p))
 
-	bufferPosition := relativePosition % bufferCap
-	bufferPositionPage := relativePosition / bufferCap
-
-	readPage := buffer.readPage.Load()
-	writePage := buffer.writePage.Load()
-
-	lastReadPosition := buffer.lastReadPosition.Load()
-	lastWritePosition := buffer.lastWritePosition.Load()
-
-	if readPage == 0 && writePage == 0 && lastReadPosition == 0 && lastWritePosition == 0 {
-		// Case 0: The buffer is empty.
-		return false
+	var readSize int64
+	if buffer.lastWritePosition-normalizedPosition >= requestedSize {
+		readSize = requestedSize
+	} else {
+		readSize = buffer.lastWritePosition - normalizedPosition
 	}
 
-	if readPage == writePage {
-		// Case 1: Same page, position must be between readPosition and writePosition.
-		return bufferPosition >= lastReadPosition && bufferPosition <= lastWritePosition
+	var bytesRead int
+	if bufferPosition+readSize <= bufferCap {
+		bytesRead = copy(p, buffer.data[bufferPosition:bufferPosition+readSize])
+	} else {
+		firstPart := bufferCap - bufferPosition
+		a := copy(p, buffer.data[bufferPosition:])
+		b := copy(p[firstPart:], buffer.data[0:readSize-firstPart])
+		bytesRead = a + b
 	}
 
-	if bufferPositionPage == readPage {
-		// Case 2: Position is on the read page.
-		return bufferPosition >= lastReadPosition
-	}
+	buffer.lastReadPosition = normalizedPosition + int64(bytesRead)
+	buffer.count -= int64(bytesRead)
 
-	if bufferPositionPage == writePage {
-		// Case 3: Position is on the write page.
-		return bufferPosition <= lastWritePosition
-	}
-
-	// Case 4: Position is in between readPage and writePage when they are not the same.
-	return readPage < writePage
+	return bytesRead, nil
 }
 
-// Waits until the given absolute position is in the buffer.
-func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, absolutePosition uint64) bool {
+func (buffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
+	return buffer.cap() - buffer.count
+}
+
+func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position int64) bool {
 	for {
 		if buffer.closed.Load() {
 			return false
 		}
 
-		if buffer.IsPositionAvailable(absolutePosition) {
+		if buffer.IsPositionAvailable(position) {
 			return true
 		}
 
@@ -254,26 +205,21 @@ func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, absolutePo
 	}
 }
 
-// Returns the number of bytes that can be written to the buffer without overwriting any data.
-func (buffer *LockingRingBuffer) GetBytesToOverwrite() uint64 {
-	bufferCap := buffer.cap()
-	bufferCount := buffer.count.Load()
+func (buffer *LockingRingBuffer) ResetToPosition(position int64) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
 
-	return bufferCap - bufferCount
-}
-
-// Resets the buffer to the given absolute position.
-func (buffer *LockingRingBuffer) ResetToPosition(absolutePosition uint64) {
-	buffer.startPosition.Store(absolutePosition)
-	buffer.readPage.Store(0)
-	buffer.lastReadPosition.Store(0)
-	buffer.writePage.Store(0)
-	buffer.lastWritePosition.Store(0)
-	buffer.count.Store(0)
+	buffer.startPosition = position
+	buffer.lastReadPosition = 0
+	buffer.lastWritePosition = 0
+	buffer.count = 0
 	buffer.data = make([]byte, buffer.cap())
 }
 
-func (buffer *LockingRingBuffer) Close() {
+func (buffer *LockingRingBuffer) Close() error {
 	buffer.closed.Store(true)
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
 	buffer.data = nil
+	return nil
 }
