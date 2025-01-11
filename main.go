@@ -1,6 +1,7 @@
 package ring_buffer_go
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -44,10 +45,14 @@ type LockingRingBuffer struct {
 	lastReadPosition  int64 // Stores normalized position (page * cap + position)
 	lastWritePosition int64 // Stores normalized position (page * cap + position)
 
-	count  int64
-	mu     sync.Mutex
+	count int64
+	mu    sync.Mutex
+
+	eof    atomic.Bool
 	closed atomic.Bool
 }
+
+var EOFMarker = []byte("__EOF__")
 
 func NewLockingRingBuffer(size int64, startPosition int64) *LockingRingBuffer {
 	return &LockingRingBuffer{
@@ -98,6 +103,11 @@ func (buffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
 		return 0, context.Canceled
 	}
 
+	if bytes.Equal(p, EOFMarker) {
+		buffer.eof.Store(true)
+		return 0, nil
+	}
+
 	bufferCap := buffer.cap()
 	requestedSize := int64(len(p))
 
@@ -138,7 +148,7 @@ func (buffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
 	return bytesWritten, nil
 }
 
-func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (n int, err error) {
+func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 
@@ -179,7 +189,12 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (n int, err er
 	buffer.lastReadPosition = normalizedPosition + int64(bytesRead)
 	buffer.count -= int64(bytesRead)
 
-	return bytesRead, nil
+	var err error
+	if bytesRead == 0 || buffer.eof.Load() {
+		err = io.EOF
+	}
+
+	return bytesRead, err
 }
 
 func (buffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
@@ -200,7 +215,7 @@ func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position i
 		case <-ctx.Done():
 			return false
 		default:
-		case <-time.After(100 * time.Microsecond):
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }
@@ -213,6 +228,7 @@ func (buffer *LockingRingBuffer) ResetToPosition(position int64) {
 	buffer.lastReadPosition = 0
 	buffer.lastWritePosition = 0
 	buffer.count = 0
+	buffer.eof.Store(false)
 	buffer.data = make([]byte, buffer.cap())
 }
 
