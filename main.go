@@ -48,16 +48,51 @@ type LockingRingBuffer struct {
 	count int64
 	mu    sync.Mutex
 
+	notFull *sync.Cond
+
 	eof    atomic.Bool
 	closed atomic.Bool
 }
 
 var EOFMarker = []byte("__EOF__")
 
+// Calculates the nearest bigger power of 2 for the given size.
+func calculateBufferSize(size int64) int64 { 
+	// Check if already a power of two
+	if size > 0 && (size & (size - 1)) == 0 {
+		return size
+	}
+	
+	// If not, find the next power of two
+	power := int64(1)
+	for power < size {
+		power *= 2
+	}
+	
+	return power
+}
+
+
 func NewLockingRingBuffer(size int64, startPosition int64) *LockingRingBuffer {
+	bufferSize := calculateBufferSize(size)
+
+	mu := sync.Mutex{}
+	notFull := sync.NewCond(&mu)
+
 	return &LockingRingBuffer{
-		data:          make([]byte, size),
+		data:          make([]byte, bufferSize),
 		startPosition: startPosition,
+
+		lastReadPosition:  0,
+		lastWritePosition: 0,
+
+		count: 0,
+		mu: mu,
+
+		notFull:  notFull,
+
+		eof:    atomic.Bool{},
+		closed: atomic.Bool{},
 	}
 }
 
@@ -70,25 +105,22 @@ func (buffer *LockingRingBuffer) getNormalizedPosition(position int64) int64 {
 }
 
 func (buffer *LockingRingBuffer) getBufferPosition(normalizedPosition int64) int64 {
-	// Handle negative positions correctly
 	cap := buffer.cap()
-	pos := normalizedPosition % cap
-	if pos < 0 {
-		pos += cap
-	}
-	return pos
+
+	return normalizedPosition & (cap - 1)
 }
 
 func (buffer *LockingRingBuffer) IsPositionAvailable(position int64) bool {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 
-	normalizedPosition := buffer.getNormalizedPosition(position)
-	if normalizedPosition < 0 {
+	if buffer.count == 0 {
 		return false
 	}
 
-	if buffer.count == 0 {
+	normalizedPosition := buffer.getNormalizedPosition(position)
+
+	if normalizedPosition < 0 {
 		return false
 	}
 
@@ -115,19 +147,12 @@ func (buffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
 		return 0, fmt.Errorf("Write data exceeds buffer size: %d", requestedSize)
 	}
 
-	for {
-		availableSpace := buffer.GetBytesToOverwrite()
-		if requestedSize <= availableSpace {
-			break
-		}
-
+	for requestedSize > buffer.GetBytesToOverwrite() {
 		if buffer.closed.Load() {
 			return 0, errors.New("Buffer is closed")
 		}
 
-		buffer.mu.Unlock()
-		time.Sleep(250 * time.Millisecond)
-		buffer.mu.Lock()
+		buffer.notFull.Wait()
 	}
 
 	bufferWritePos := buffer.getBufferPosition(buffer.lastWritePosition)
@@ -189,6 +214,8 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
 	buffer.lastReadPosition = normalizedPosition + int64(bytesRead)
 	buffer.count -= int64(bytesRead)
 
+	buffer.notFull.Signal()
+
 	var err error
 	if bytesRead == 0 || buffer.eof.Load() {
 		err = io.EOF
@@ -198,7 +225,9 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
 }
 
 func (buffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
-	return buffer.cap() - buffer.count
+	count := atomic.LoadInt64(&buffer.count)
+
+	return buffer.cap() - count
 }
 
 func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position int64) bool {
@@ -229,13 +258,20 @@ func (buffer *LockingRingBuffer) ResetToPosition(position int64) {
 	buffer.lastWritePosition = 0
 	buffer.count = 0
 	buffer.eof.Store(false)
-	buffer.data = make([]byte, buffer.cap())
+
+	for i := range buffer.data {
+		buffer.data[i] = 0
+	}
 }
 
 func (buffer *LockingRingBuffer) Close() error {
 	buffer.closed.Store(true)
+
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
+
+	buffer.notFull.Broadcast()
+
 	buffer.data = nil
 	return nil
 }
