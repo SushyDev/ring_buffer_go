@@ -45,7 +45,7 @@ type LockingRingBuffer struct {
 	lastReadPosition  int64 // Stores normalized position (page * cap + position)
 	lastWritePosition int64 // Stores normalized position (page * cap + position)
 
-	count int64
+	count atomic.Int64
 	mu    sync.Mutex
 
 	notFull *sync.Cond
@@ -76,24 +76,14 @@ func calculateBufferSize(size int64) int64 {
 func NewLockingRingBuffer(size int64, startPosition int64) *LockingRingBuffer {
 	bufferSize := calculateBufferSize(size)
 
-	mu := sync.Mutex{}
-	notFull := sync.NewCond(&mu)
-
-	return &LockingRingBuffer{
+	lockingRingBuffer := &LockingRingBuffer{
 		data:          make([]byte, bufferSize),
 		startPosition: startPosition,
-
-		lastReadPosition:  0,
-		lastWritePosition: 0,
-
-		count: 0,
-		mu: mu,
-
-		notFull:  notFull,
-
-		eof:    atomic.Bool{},
-		closed: atomic.Bool{},
 	}
+
+	lockingRingBuffer.notFull = sync.NewCond(&lockingRingBuffer.mu)
+
+	return lockingRingBuffer
 }
 
 func (buffer *LockingRingBuffer) cap() int64 {
@@ -114,7 +104,7 @@ func (buffer *LockingRingBuffer) IsPositionAvailable(position int64) bool {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 
-	if buffer.count == 0 {
+	if buffer.count.Load() == 0 {
 		return false
 	}
 
@@ -168,7 +158,7 @@ func (buffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
 	}
 
 	buffer.lastWritePosition += int64(bytesWritten)
-	buffer.count += int64(bytesWritten)
+	buffer.count.Add(int64(bytesWritten))
 
 	return bytesWritten, nil
 }
@@ -181,7 +171,7 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
 		return 0, errors.New("Buffer is closed")
 	}
 
-	if buffer.count <= 0 {
+	if buffer.count.Load() <= 0 {
 		return 0, errors.New("Buffer is empty")
 	}
 
@@ -212,7 +202,7 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
 	}
 
 	buffer.lastReadPosition = normalizedPosition + int64(bytesRead)
-	buffer.count -= int64(bytesRead)
+	buffer.count.Store(buffer.count.Load() - int64(bytesRead))
 
 	buffer.notFull.Signal()
 
@@ -225,11 +215,10 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
 }
 
 func (buffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
-	count := atomic.LoadInt64(&buffer.count)
-
-	return buffer.cap() - count
+	return buffer.cap() - buffer.count.Load()
 }
 
+// Todo rewrite to sync.Cond for improved efficiency
 func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position int64) bool {
 	for {
 		if buffer.closed.Load() {
@@ -256,7 +245,7 @@ func (buffer *LockingRingBuffer) ResetToPosition(position int64) {
 	buffer.startPosition = position
 	buffer.lastReadPosition = 0
 	buffer.lastWritePosition = 0
-	buffer.count = 0
+	buffer.count.Store(0)
 	buffer.eof.Store(false)
 
 	for i := range buffer.data {
