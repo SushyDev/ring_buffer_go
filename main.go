@@ -1,59 +1,36 @@
-// Package ring_buffer_go implements a locking ring buffer with read/write capabilities.
+// Package ring_buffer_go provides a concurrency-safe ring buffer with absolute
+// position addressing, blocking writes when full, and bounded waiting for data
+// to appear at a given absolute position.
 package ring_buffer_go
 
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"os"
 	"sync"
 	"sync/atomic"
 )
 
-type LockingRingBufferInterface interface {
-	GetCapacity() int64
-	GetSize() int64
-	GetStartPosition() int64
-
-	// Reads from the buffer at the given absolute position.
-	ReadAt(p []byte, position int64) (n int, err error)
-
-	// Appends data to the buffer and returns the number of bytes written.
-	Write(p []byte) (n int, err error)
-
-	// Returns the number of bytes that can be written to the buffer without overwriting any data.
-	GetBytesToOverwrite() int64
-
-	// Calculates if the given absolute position is in the buffer.
-	IsPositionAvailable(position int64) bool
-
-	// Checks if the given absolute position is within the buffer's capacity.
-	IsPositionInCapacity(position int64, tolerance int64) bool
-
-	// Waits until the given absolute position is in the buffer.
-	WaitForPosition(ctx context.Context, position int64) bool
-
-	// Resets the buffer to the given absolute position.
-	ResetToPosition(position int64)
-
-	// Closes the buffer.
-	Close() error
-}
-
-var _ LockingRingBufferInterface = &LockingRingBuffer{}
-var _ io.WriteCloser = &LockingRingBuffer{}
-var _ io.ReaderAt = &LockingRingBuffer{}
-
-// ErrOutOfRange indicates the requested position is no longer available in the buffer window.
-var ErrOutOfRange = errors.New("ringbuffer: position out of range")
-
+// LockingRingBuffer is a concurrency-safe ring buffer.
+//
+// Internal state:
+//   - data: underlying circular storage of size cap(data)
+//   - startPosition: absolute base used to compute normalized offsets
+//   - lastReadPosition: normalized offset after the last read byte
+//   - lastWritePosition: normalized offset after the last written byte
+//   - count: number of unread bytes currently stored
+//   - notFull/available: condition variables for writers/readers
+//   - eof/closed: flags for logical end-of-stream and closure
+//
+// All fields are mutated under mu except the atomic flags/counters which are
+// still accessed under mu for consistent snapshots.
 type LockingRingBuffer struct {
 	data          []byte
 	startPosition int64
 
-	lastReadPosition  int64 // Stores normalized position (page * cap + position)
-	lastWritePosition int64 // Stores normalized position (page * cap + position)
+	lastReadPosition  int64
+	lastWritePosition int64
 
 	count atomic.Int64
 	mu    sync.Mutex
@@ -65,321 +42,298 @@ type LockingRingBuffer struct {
 	closed atomic.Bool
 }
 
+// EOFMarker signals logical end-of-stream when written via Write.
 var EOFMarker = []byte("__EOF__")
 
-// Calculates the nearest bigger power of 2 for the given size.
-func calculateBufferSize(size int64) int64 {
-	// Check if already a power of two
-	if size > 0 && (size&(size-1)) == 0 {
-		return size
-	}
-
-	// If not, find the next power of two
-	power := int64(1)
-	for power < size {
-		power *= 2
-	}
-
-	return power
-}
-
+// NewLockingRingBuffer constructs a new ring buffer with a capacity rounded up
+// to the next power of two, starting at startPosition.
 func NewLockingRingBuffer(size int64, startPosition int64) *LockingRingBuffer {
 	bufferSize := calculateBufferSize(size)
-
-	lockingRingBuffer := &LockingRingBuffer{
+	ringBuffer := &LockingRingBuffer{
 		data:          make([]byte, bufferSize),
 		startPosition: startPosition,
 	}
-
-	lockingRingBuffer.notFull = sync.NewCond(&lockingRingBuffer.mu)
-	lockingRingBuffer.available = sync.NewCond(&lockingRingBuffer.mu)
-
-	return lockingRingBuffer
+	ringBuffer.notFull = sync.NewCond(&ringBuffer.mu)
+	ringBuffer.available = sync.NewCond(&ringBuffer.mu)
+	return ringBuffer
 }
 
-func (buffer *LockingRingBuffer) earliest() int64 {
-	if buffer.count.Load() == 0 {
-		return -1
-	}
-
-	return buffer.lastWritePosition - buffer.count.Load()
+// GetCapacity returns the fixed capacity of the buffer.
+func (ringBuffer *LockingRingBuffer) GetCapacity() int64 {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	return ringBuffer.cap()
 }
 
-func (buffer *LockingRingBuffer) cap() int64 {
-	return int64(cap(buffer.data))
+// GetSize returns the current number of unread bytes.
+func (ringBuffer *LockingRingBuffer) GetSize() int64 {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	return ringBuffer.count.Load()
 }
 
-func (buffer *LockingRingBuffer) GetCapacity() int64 {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-	return buffer.cap()
+// GetStartPosition returns the absolute start position.
+func (ringBuffer *LockingRingBuffer) GetStartPosition() int64 {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	return ringBuffer.startPosition
 }
 
-func (buffer *LockingRingBuffer) GetSize() int64 {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-	return buffer.count.Load()
-}
+// Write appends p to the buffer, blocking if needed to avoid overwriting unread
+// data. If p equals EOFMarker, Write marks logical EOF, notifies waiters, and
+// returns (0, nil).
+func (ringBuffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
 
-func (buffer *LockingRingBuffer) GetStartPosition() int64 {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-	return buffer.startPosition
-}
-
-func (buffer *LockingRingBuffer) getNormalizedPosition(position int64) int64 {
-	return position - buffer.startPosition
-}
-
-func (buffer *LockingRingBuffer) getBufferPosition(normalizedPosition int64) int64 {
-	cap := buffer.cap()
-	return normalizedPosition & (cap - 1)
-}
-
-func (buffer *LockingRingBuffer) isPositionAvailableLocked(position int64) bool {
-	if buffer.count.Load() == 0 {
-		return false
-	}
-
-	normalizedPosition := buffer.getNormalizedPosition(position)
-	if normalizedPosition < 0 {
-		return false
-	}
-
-	earliest := buffer.earliest()
-
-	return normalizedPosition >= earliest && normalizedPosition <= buffer.lastWritePosition
-}
-
-func (buffer *LockingRingBuffer) IsPositionAvailable(position int64) bool {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-	return buffer.isPositionAvailableLocked(position)
-}
-
-func (buffer *LockingRingBuffer) Write(p []byte) (n int, err error) {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-
-	if buffer.closed.Load() {
+	if ringBuffer.closed.Load() {
 		return 0, os.ErrClosed
 	}
-
 	if bytes.Equal(p, EOFMarker) {
-		buffer.eof.Store(true)
-		// wake any readers waiting for EOF boundary
-		buffer.available.Broadcast()
+		ringBuffer.eof.Store(true)
+		ringBuffer.available.Broadcast()
 		return 0, nil
 	}
 
-	bufferCap := buffer.cap()
-	requestedSize := int64(len(p))
-
-	if requestedSize > bufferCap {
+	capacity := ringBuffer.cap()
+	requested := int64(len(p))
+	if requested > capacity {
 		return 0, io.ErrShortWrite
 	}
-
-	for requestedSize > buffer.GetBytesToOverwrite() {
-		if buffer.closed.Load() {
+	for requested > ringBuffer.GetBytesToOverwrite() {
+		if ringBuffer.closed.Load() {
 			return 0, os.ErrClosed
 		}
-		buffer.notFull.Wait()
+		ringBuffer.notFull.Wait()
 	}
 
-	bufferWritePos := buffer.getBufferPosition(buffer.lastWritePosition)
-
+	writePosition := ringBuffer.getBufferPosition(ringBuffer.lastWritePosition)
 	var bytesWritten int
-	if bufferWritePos+requestedSize <= bufferCap {
-		bytesWritten = copy(buffer.data[bufferWritePos:], p)
+	if writePosition+requested <= capacity {
+		bytesWritten = copy(ringBuffer.data[writePosition:], p)
 	} else {
-		firstPart := bufferCap - bufferWritePos
-		a := copy(buffer.data[bufferWritePos:], p[:firstPart])
-		b := copy(buffer.data[0:], p[firstPart:])
-		bytesWritten = a + b
+		firstSegment := capacity - writePosition
+		firstCopy := copy(ringBuffer.data[writePosition:], p[:firstSegment])
+		secondCopy := copy(ringBuffer.data[0:], p[firstSegment:])
+		bytesWritten = firstCopy + secondCopy
 	}
 
-	buffer.lastWritePosition += int64(bytesWritten)
-	buffer.count.Add(int64(bytesWritten))
-
-	// Notify readers that data is available and writers that space might have changed
-	buffer.available.Broadcast()
-	buffer.notFull.Broadcast()
-
+	ringBuffer.lastWritePosition += int64(bytesWritten)
+	ringBuffer.count.Add(int64(bytesWritten))
+	ringBuffer.available.Broadcast()
+	ringBuffer.notFull.Broadcast()
 	return bytesWritten, nil
 }
 
-func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
+// ReadAt reads from the absolute position into p. It returns ErrOutOfRange if
+// the position is behind the read cursor, and io.EOF if the position is beyond
+// the last written offset. When fewer bytes than requested are available, it may
+// return (n > 0, io.EOF), including when EOFMarker was set.
+func (ringBuffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
 
-	if buffer.closed.Load() {
+	if ringBuffer.closed.Load() {
 		return 0, os.ErrClosed
 	}
-
-	if buffer.count.Load() <= 0 {
+	if ringBuffer.count.Load() <= 0 {
 		return 0, io.EOF
 	}
 
-	normalizedPosition := buffer.getNormalizedPosition(position)
-
-	if normalizedPosition < buffer.lastReadPosition {
+	normalized := ringBuffer.getNormalizedPosition(position)
+	if normalized < ringBuffer.lastReadPosition {
 		return 0, ErrOutOfRange
 	}
-
-	if normalizedPosition > buffer.lastWritePosition {
+	if normalized > ringBuffer.lastWritePosition {
 		return 0, io.EOF
 	}
 
-	// if normalizedPosition > buffer.lastWritePosition {
-	// 	return 0, io.EOF
-	// }
-
-	bufferPosition := buffer.getBufferPosition(normalizedPosition)
-	bufferCap := buffer.cap()
-	requestedSize := int64(len(p))
-
-	readSize := min(buffer.lastWritePosition-normalizedPosition, requestedSize)
+	bufferPosition := ringBuffer.getBufferPosition(normalized)
+	capacity := ringBuffer.cap()
+	requested := int64(len(p))
+	readSize := min(ringBuffer.lastWritePosition-normalized, requested)
 	if readSize <= 0 {
 		return 0, io.EOF
 	}
 
 	var bytesRead int
-	if bufferPosition+readSize <= bufferCap {
-		bytesRead = copy(p, buffer.data[bufferPosition:bufferPosition+readSize])
+	if bufferPosition+readSize <= capacity {
+		bytesRead = copy(p, ringBuffer.data[bufferPosition:bufferPosition+readSize])
 	} else {
-		firstPart := bufferCap - bufferPosition
-		a := copy(p, buffer.data[bufferPosition:])
-		b := copy(p[firstPart:], buffer.data[0:readSize-firstPart])
-		bytesRead = a + b
+		firstSegment := capacity - bufferPosition
+		firstCopy := copy(p, ringBuffer.data[bufferPosition:])
+		secondCopy := copy(p[firstSegment:], ringBuffer.data[0:readSize-firstSegment])
+		bytesRead = firstCopy + secondCopy
 	}
 
-	buffer.lastReadPosition = normalizedPosition + int64(bytesRead)
-	// Decrease count by bytesRead; safe under lock, but use atomic Add for clarity
-	buffer.count.Add(-int64(bytesRead))
+	ringBuffer.lastReadPosition = normalized + int64(bytesRead)
+	ringBuffer.count.Add(-int64(bytesRead))
+	ringBuffer.notFull.Broadcast()
 
-	// Wake any writers that might be waiting for space
-	buffer.notFull.Broadcast()
-
-	// Per io.ReaderAt, it's allowed to return EOF with n>0 when fewer bytes than requested are available.
 	var err error
-	if bytesRead == 0 || buffer.eof.Load() || int64(bytesRead) < requestedSize {
+	if bytesRead == 0 || ringBuffer.eof.Load() || int64(bytesRead) < requested {
 		err = io.EOF
 	}
-
 	return bytesRead, err
 }
 
-func (buffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
-	return buffer.cap() - buffer.count.Load()
+// IsPositionAvailable reports whether the absolute position lies inside the
+// current readable window (inclusive at the write boundary).
+func (ringBuffer *LockingRingBuffer) IsPositionAvailable(position int64) bool {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	return ringBuffer.isPositionAvailableLocked(position)
 }
 
-// IsPositionInCapacity detects wether absolute position is within the buffer's capacity, considering a tolerance
-func (buffer *LockingRingBuffer) IsPositionInCapacity(position int64, tolerance int64) bool {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-
-	if buffer.closed.Load() {
+// IsPositionInCapacity reports whether an absolute position can be represented
+// within one capacity span of the current buffer window, allowing a tolerance
+// on both sides. This does not assert that data is present in the buffer.
+func (ringBuffer *LockingRingBuffer) IsPositionInCapacity(position int64, tolerance int64) bool {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	if ringBuffer.closed.Load() {
 		return false
 	}
-
-	norm := buffer.getNormalizedPosition(position)
-	cap := buffer.cap()
-
-	if norm < 0 {
+	normalized := ringBuffer.getNormalizedPosition(position)
+	if normalized < 0 {
 		return false
 	}
-
-	// Define a capacity window centered on the current buffer window,
-	// allowing tolerance on both sides but not exceeding one capacity span.
-	lower := buffer.lastReadPosition - tolerance
-	upper := buffer.lastWritePosition + tolerance + cap
-
-	return norm >= lower && norm < upper
+	capacity := ringBuffer.cap()
+	lowerBound := ringBuffer.lastReadPosition - tolerance
+	upperBound := ringBuffer.lastWritePosition + tolerance + capacity
+	return normalized >= lowerBound && normalized < upperBound
 }
 
-func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position int64) bool {
-	// Fast path: if already closed, nothing to wait for
-	if buffer.closed.Load() {
+// GetBytesToOverwrite returns the number of free bytes available for writes
+// without overwriting unread data.
+func (ringBuffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
+	return ringBuffer.cap() - ringBuffer.count.Load()
+}
+
+// WaitForPosition blocks until the position becomes available, the buffer is
+// closed, EOF guarantees the position will never be written, or the context is
+// canceled. It returns true only if the position became available.
+func (ringBuffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position int64) bool {
+	if ringBuffer.closed.Load() {
 		return false
 	}
-
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-
-	// If already available, return immediately
-	if buffer.isPositionAvailableLocked(position) {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	if ringBuffer.isPositionAvailableLocked(position) {
 		return true
 	}
-
-	// Arrange for context cancellation to wake waiters.
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			buffer.mu.Lock()
-			buffer.available.Broadcast()
-			buffer.mu.Unlock()
+			ringBuffer.mu.Lock()
+			ringBuffer.available.Broadcast()
+			ringBuffer.mu.Unlock()
 		case <-done:
 		}
 	}()
 	defer close(done)
-
-	for !buffer.closed.Load() && !buffer.isPositionAvailableLocked(position) {
-		// Abort on context cancellation
+	for !ringBuffer.closed.Load() && !ringBuffer.isPositionAvailableLocked(position) {
 		if ctx.Err() != nil {
 			return false
 		}
-
-		// If the requested position has been overwritten already, it can never become available again.
-		normalizedPosition := buffer.getNormalizedPosition(position)
-		if normalizedPosition < buffer.lastReadPosition {
+		normalized := ringBuffer.getNormalizedPosition(position)
+		if normalized < ringBuffer.lastReadPosition {
 			return false
 		}
-		// If EOF reached and the requested position is beyond last written, it will never appear.
-		if buffer.eof.Load() && normalizedPosition > buffer.lastWritePosition {
+		if ringBuffer.eof.Load() && normalized > ringBuffer.lastWritePosition {
 			return false
 		}
-
-		// Wait for more data or state change.
-		buffer.available.Wait()
+		ringBuffer.available.Wait()
 	}
-
-	if buffer.closed.Load() {
+	if ringBuffer.closed.Load() {
 		return false
 	}
-
-	return buffer.isPositionAvailableLocked(position)
+	return ringBuffer.isPositionAvailableLocked(position)
 }
 
-func (buffer *LockingRingBuffer) ResetToPosition(position int64) {
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-
-	buffer.startPosition = position
-	buffer.lastReadPosition = 0
-	buffer.lastWritePosition = 0
-	buffer.count.Store(0)
-	buffer.eof.Store(false)
-
-	// Clear buffer data
-	for i := range buffer.data {
-		buffer.data[i] = 0
+// ResetToPosition clears the buffer and resets all internal cursors to start
+// from the provided absolute position.
+func (ringBuffer *LockingRingBuffer) ResetToPosition(position int64) {
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	ringBuffer.startPosition = position
+	ringBuffer.lastReadPosition = 0
+	ringBuffer.lastWritePosition = 0
+	ringBuffer.count.Store(0)
+	ringBuffer.eof.Store(false)
+	for i := range ringBuffer.data {
+		ringBuffer.data[i] = 0
 	}
-
-	buffer.notFull.Broadcast()
-	buffer.available.Broadcast()
+	ringBuffer.notFull.Broadcast()
+	ringBuffer.available.Broadcast()
 }
 
-func (buffer *LockingRingBuffer) Close() error {
-	buffer.closed.Store(true)
-
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-
-	buffer.data = nil
-
-	buffer.notFull.Broadcast()
-	buffer.available.Broadcast()
-
+// Close marks the buffer closed, releases all waiting readers/writers, and
+// clears the underlying storage reference. Further operations fail with
+// os.ErrClosed.
+func (ringBuffer *LockingRingBuffer) Close() error {
+	ringBuffer.closed.Store(true)
+	ringBuffer.mu.Lock()
+	defer ringBuffer.mu.Unlock()
+	ringBuffer.data = nil
+	ringBuffer.notFull.Broadcast()
+	ringBuffer.available.Broadcast()
 	return nil
+}
+
+// =========================
+// Implementation helpers
+// =========================
+
+// calculateBufferSize returns the smallest power of two >= size.
+func calculateBufferSize(size int64) int64 {
+	if size > 0 && (size&(size-1)) == 0 {
+		return size
+	}
+	power := int64(1)
+	for power < size {
+		power *= 2
+	}
+	return power
+}
+
+// cap returns the capacity as an int64.
+func (ringBuffer *LockingRingBuffer) cap() int64 { return int64(cap(ringBuffer.data)) }
+
+// earliest returns the normalized offset of the earliest unread byte, or -1 if
+// the buffer is empty.
+func (ringBuffer *LockingRingBuffer) earliest() int64 {
+	if ringBuffer.count.Load() == 0 {
+		return -1
+	}
+	return ringBuffer.lastWritePosition - ringBuffer.count.Load()
+}
+
+// getNormalizedPosition converts an absolute position into the linear,
+// monotonically increasing normalized offset used by the buffer.
+func (ringBuffer *LockingRingBuffer) getNormalizedPosition(position int64) int64 {
+	return position - ringBuffer.startPosition
+}
+
+// getBufferPosition maps a normalized offset to a physical index in the
+// underlying storage using a power-of-two mask.
+func (ringBuffer *LockingRingBuffer) getBufferPosition(normalized int64) int64 {
+	capacity := ringBuffer.cap()
+	return normalized & (capacity - 1)
+}
+
+// isPositionAvailableLocked reports whether the absolute position lies inside
+// the current readable window (inclusive at the upper boundary). Caller holds
+// ringBuffer.mu.
+func (ringBuffer *LockingRingBuffer) isPositionAvailableLocked(position int64) bool {
+	if ringBuffer.count.Load() == 0 {
+		return false
+	}
+	normalized := ringBuffer.getNormalizedPosition(position)
+	if normalized < 0 {
+		return false
+	}
+	earliest := ringBuffer.earliest()
+	return normalized >= earliest && normalized <= ringBuffer.lastWritePosition
 }

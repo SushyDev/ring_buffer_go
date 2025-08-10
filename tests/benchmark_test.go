@@ -1,14 +1,16 @@
-package ring_buffer_go
+package ring_buffer_go_test
 
 import (
 	"context"
 	"sync"
 	"testing"
+
+	rb "github.com/sushydev/ring_buffer_go"
 )
 
 func benchmarkProducerConsumer(b *testing.B, bufferSize int64, dataSize int) {
 	b.Helper()
-	buffer := NewLockingRingBuffer(bufferSize, 0)
+	buffer := rb.NewLockingRingBuffer(bufferSize, 0)
 	defer buffer.Close()
 
 	data := make([]byte, dataSize)

@@ -1,4 +1,4 @@
-package ring_buffer_go
+package ring_buffer_go_test
 
 import (
 	"context"
@@ -9,9 +9,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	rb "github.com/sushydev/ring_buffer_go"
 )
 
-func TestCalculateBufferSize(t *testing.T) {
+func TestCapacityRoundingViaPublicAPI(t *testing.T) {
 	t.Parallel()
 	testCases := []struct {
 		name     string
@@ -31,23 +32,24 @@ func TestCalculateBufferSize(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, calculateBufferSize(tc.input))
+			buffer := rb.NewLockingRingBuffer(tc.input, 0)
+			assert.Equal(t, tc.expected, buffer.GetCapacity())
 		})
 	}
 }
 
-func TestNewLockingRingBuffer(t *testing.T) {
+func TestNewLockingRingBuffer_PublicFields(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(10, 100)
+	buffer := rb.NewLockingRingBuffer(10, 100)
 	require.NotNil(t, buffer)
-	assert.Equal(t, int64(16), buffer.cap(), "Capacity should be next power of two")
-	assert.Equal(t, int64(100), buffer.startPosition, "StartPosition should be set")
+	assert.Equal(t, int64(16), buffer.GetCapacity(), "Capacity should be next power of two")
+	assert.Equal(t, int64(100), buffer.GetStartPosition(), "StartPosition should be set")
 	assert.Equal(t, int64(16), buffer.GetBytesToOverwrite(), "BytesToOverwrite should be full capacity")
 }
 
 func TestWriteRead(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(10, 0) // effective capacity 16
+	buffer := rb.NewLockingRingBuffer(10, 0) // effective capacity 16
 	data := []byte("hello world")
 
 	n, err := buffer.Write(data)
@@ -63,7 +65,7 @@ func TestWriteRead(t *testing.T) {
 
 func TestReadAtPartial(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(20, 0) // effective capacity 32
+	buffer := rb.NewLockingRingBuffer(20, 0) // effective capacity 32
 	data := []byte("hello world")
 	_, err := buffer.Write(data)
 	require.NoError(t, err)
@@ -85,7 +87,7 @@ func TestReadAtPartial(t *testing.T) {
 
 func TestWrapAround(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(8, 0) // effective capacity 8
+	buffer := rb.NewLockingRingBuffer(8, 0) // effective capacity 8
 
 	// First write fits, second write would block without a consumer since cap=8
 	_, err := buffer.Write([]byte("12345"))
@@ -135,7 +137,7 @@ func TestWrapAround(t *testing.T) {
 
 func TestWriteBlocksWhenFull(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(8, 0) // capacity 8
+	buffer := rb.NewLockingRingBuffer(8, 0) // capacity 8
 	_, err := buffer.Write(make([]byte, 8))
 	require.NoError(t, err)
 
@@ -169,7 +171,7 @@ func TestWriteBlocksWhenFull(t *testing.T) {
 
 func TestWaitForPosition(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(16, 100)
+	buffer := rb.NewLockingRingBuffer(16, 100)
 
 	// Test success
 	go func() {
@@ -198,13 +200,13 @@ func TestWaitForPosition(t *testing.T) {
 
 func TestReset(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(10, 0)
+	buffer := rb.NewLockingRingBuffer(10, 0)
 	_, err := buffer.Write([]byte("12345"))
 	require.NoError(t, err)
 
 	buffer.ResetToPosition(100)
-	assert.Equal(t, int64(100), buffer.startPosition)
-	assert.Equal(t, int64(0), buffer.count.Load())
+	assert.Equal(t, int64(100), buffer.GetStartPosition())
+	assert.Equal(t, int64(0), buffer.GetSize())
 	assert.False(t, buffer.IsPositionAvailable(0))
 	assert.False(t, buffer.IsPositionAvailable(100))
 
@@ -215,12 +217,12 @@ func TestReset(t *testing.T) {
 
 func TestEOF(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(20, 0)
+	buffer := rb.NewLockingRingBuffer(20, 0)
 	data := []byte("some data")
 	_, err := buffer.Write(data)
 	require.NoError(t, err)
 
-	_, err = buffer.Write(EOFMarker)
+	_, err = buffer.Write(rb.EOFMarker)
 	require.NoError(t, err)
 
 	readBuf := make([]byte, len(data))
@@ -238,7 +240,7 @@ func TestEOF(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(8, 0)
+	buffer := rb.NewLockingRingBuffer(8, 0)
 	_, err := buffer.Write(make([]byte, 8))
 	require.NoError(t, err)
 
@@ -269,7 +271,7 @@ func TestClose(t *testing.T) {
 
 func TestIsPositionAvailable(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(10, 100) // capacity 16
+	buffer := rb.NewLockingRingBuffer(10, 100) // capacity 16
 
 	assert.False(t, buffer.IsPositionAvailable(100))
 
@@ -296,7 +298,7 @@ func TestIsPositionAvailable(t *testing.T) {
 
 func TestConcurrentReadWrite(t *testing.T) {
 	t.Parallel()
-	buffer := NewLockingRingBuffer(1<<12, 0) // 4KB
+	buffer := rb.NewLockingRingBuffer(1<<12, 0) // 4KB
 	iterations := 1000
 	chunkSize := 100
 	totalDataSize := iterations * chunkSize
