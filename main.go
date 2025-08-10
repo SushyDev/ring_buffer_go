@@ -1,3 +1,4 @@
+// Package ring_buffer_go implements a locking ring buffer with read/write capabilities.
 package ring_buffer_go
 
 import (
@@ -28,7 +29,7 @@ type LockingRingBufferInterface interface {
 	IsPositionAvailable(position int64) bool
 
 	// Checks if the given absolute position is within the buffer's capacity.
-	IsPositionInCapacity(position int64) bool
+	IsPositionInCapacity(position int64, tolerance int64) bool
 
 	// Waits until the given absolute position is in the buffer.
 	WaitForPosition(ctx context.Context, position int64) bool
@@ -220,18 +221,24 @@ func (buffer *LockingRingBuffer) ReadAt(p []byte, position int64) (int, error) {
 	}
 
 	normalizedPosition := buffer.getNormalizedPosition(position)
+
 	if normalizedPosition < buffer.lastReadPosition {
 		return 0, ErrOutOfRange
 	}
+
 	if normalizedPosition > buffer.lastWritePosition {
 		return 0, io.EOF
 	}
+
+	// if normalizedPosition > buffer.lastWritePosition {
+	// 	return 0, io.EOF
+	// }
 
 	bufferPosition := buffer.getBufferPosition(normalizedPosition)
 	bufferCap := buffer.cap()
 	requestedSize := int64(len(p))
 
-	readSize := min(buffer.lastWritePosition - normalizedPosition, requestedSize)
+	readSize := min(buffer.lastWritePosition-normalizedPosition, requestedSize)
 	if readSize <= 0 {
 		return 0, io.EOF
 	}
@@ -266,7 +273,8 @@ func (buffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
 	return buffer.cap() - buffer.count.Load()
 }
 
-func (buffer *LockingRingBuffer) IsPositionInCapacity(position int64) bool {
+// IsPositionInCapacity detects wether absolute position is within the buffer's capacity, considering a tolerance
+func (buffer *LockingRingBuffer) IsPositionInCapacity(position int64, tolerance int64) bool {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 
@@ -274,12 +282,19 @@ func (buffer *LockingRingBuffer) IsPositionInCapacity(position int64) bool {
 		return false
 	}
 
-	normalizedPosition := buffer.getNormalizedPosition(position)
-	if normalizedPosition < 0 || normalizedPosition >= buffer.cap() {
+	norm := buffer.getNormalizedPosition(position)
+	cap := buffer.cap()
+
+	if norm < 0 {
 		return false
 	}
 
-	return true
+	// Define a capacity window centered on the current buffer window,
+	// allowing tolerance on both sides but not exceeding one capacity span.
+	lower := buffer.lastReadPosition - tolerance
+	upper := buffer.lastWritePosition + tolerance + cap
+
+	return norm >= lower && norm < upper
 }
 
 func (buffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position int64) bool {
