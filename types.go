@@ -15,9 +15,9 @@ import (
 //
 // Notes on semantics:
 //   - IsPositionAvailable reports whether a position lies inside the current
-//     readable window [earliest, lastWritePosition], with an inclusive upper
-//     bound at the write boundary (the boundary itself is considered
-//     "available").
+//     readable window [earliest, lastWritePosition). The upper bound is
+//     exclusive: lastWritePosition is the offset one past the last written byte,
+//     so a position equal to lastWritePosition is not yet available.
 //   - ReadAt advances the shared read cursor; attempts to read behind the
 //     cursor return ErrOutOfRange, and attempts to read beyond the last written
 //     position return io.EOF.

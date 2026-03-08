@@ -24,9 +24,12 @@ func TestPointerMath_EmptyAndSingleByte(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
-	// Availability semantics are inclusive at upper bound
+	// Availability: the window is [earliest, lastWritePosition), exclusive upper bound.
+	// After writing 1 byte at startPosition 10, lastWritePosition (normalised) = 1.
+	// Position 10 → normalised 0: in [0,1) → available.
+	// Position 11 → normalised 1: not in [0,1) (exclusive upper bound) → not available.
 	assert.True(t, buf.IsPositionAvailable(10)) // first byte
-	assert.True(t, buf.IsPositionAvailable(11)) // boundary (end index)
+	assert.False(t, buf.IsPositionAvailable(11)) // one past end — not yet written
 	assert.False(t, buf.IsPositionAvailable(9))
 	assert.False(t, buf.IsPositionAvailable(12))
 
@@ -104,9 +107,11 @@ func TestAvailabilityWindowMovement(t *testing.T) {
 	_, err := buf.Write([]byte("abcdef")) // 1000..1005
 	require.NoError(t, err)
 
-	// initial availability inclusive of endpoint
+	// Window is [earliest, lastWritePosition), exclusive upper bound.
+	// After writing "abcdef" (6 bytes) at start=1000, lastWritePosition (norm) = 6.
+	// Position 1006 → norm 6: not in [0, 6) → not available.
 	assert.True(t, buf.IsPositionAvailable(1000))
-	assert.True(t, buf.IsPositionAvailable(1006)) // boundary
+	assert.False(t, buf.IsPositionAvailable(1006)) // one past last written byte
 	assert.False(t, buf.IsPositionAvailable(999))
 
 	// Read 4 bytes -> earliest moves to 1004
@@ -119,7 +124,7 @@ func TestAvailabilityWindowMovement(t *testing.T) {
 	assert.False(t, buf.IsPositionAvailable(1000))
 	assert.False(t, buf.IsPositionAvailable(1003))
 	assert.True(t, buf.IsPositionAvailable(1004)) // next unread
-	assert.True(t, buf.IsPositionAvailable(1006)) // boundary
+	assert.False(t, buf.IsPositionAvailable(1006)) // one past last written byte (exclusive upper bound)
 }
 
 func TestWaitForPosition_EOFAndOverwritten(t *testing.T) {
@@ -134,8 +139,8 @@ func TestWaitForPosition_EOFAndOverwritten(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	assert.True(t, buf.WaitForPosition(ctx, 2))  // last byte index
-	assert.True(t, buf.WaitForPosition(ctx, 3))  // boundary
+	assert.True(t, buf.WaitForPosition(ctx, 2))  // last written byte (norm 2 < lastWritePosition 3)
+	assert.False(t, buf.WaitForPosition(ctx, 3)) // one past end (exclusive upper bound; EOF prevents future writes)
 	assert.False(t, buf.WaitForPosition(ctx, 4)) // beyond, EOF reached
 }
 
@@ -186,5 +191,5 @@ func TestResetClearsPointersAndWindow(t *testing.T) {
 	_, err := buf.Write([]byte("xy"))
 	require.NoError(t, err)
 	assert.True(t, buf.IsPositionAvailable(100))
-	assert.True(t, buf.IsPositionAvailable(102)) // boundary
+	assert.False(t, buf.IsPositionAvailable(102)) // one past end (exclusive upper bound)
 }

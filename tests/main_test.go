@@ -275,23 +275,24 @@ func TestIsPositionAvailable(t *testing.T) {
 
 	assert.False(t, buffer.IsPositionAvailable(100))
 
-	_, err := buffer.Write([]byte("hello")) // writes at 100-104
+	_, err := buffer.Write([]byte("hello")) // writes bytes at positions 100-104 (lastWritePosition normalised = 5)
 	require.NoError(t, err)
 
 	assert.True(t, buffer.IsPositionAvailable(100))
 	assert.True(t, buffer.IsPositionAvailable(104))
-	// Endpoint (105) is considered available by current semantics (inclusive)
-	assert.True(t, buffer.IsPositionAvailable(105))
+	// lastWritePosition is the exclusive upper bound — the byte at position 105
+	// has not been written yet, so it must not be reported as available.
+	assert.False(t, buffer.IsPositionAvailable(105))
 	assert.False(t, buffer.IsPositionAvailable(99))
 
 	readBuf := make([]byte, 2)
-	_, err = buffer.ReadAt(readBuf, 100) // reads 100-101
+	_, err = buffer.ReadAt(readBuf, 100) // reads bytes at 100-101; lastReadPosition normalised advances to 2
 	require.NoError(t, err)
 
-	// After reading two bytes, positions below new lastReadPosition (<=101) are no longer available
+	// Positions before lastReadPosition are no longer available.
 	assert.False(t, buffer.IsPositionAvailable(100))
 	assert.False(t, buffer.IsPositionAvailable(101))
-	// Positions between lastReadPosition and lastWritePosition remain available
+	// Positions in [lastReadPosition, lastWritePosition) remain available.
 	assert.True(t, buffer.IsPositionAvailable(102))
 	assert.True(t, buffer.IsPositionAvailable(104))
 }

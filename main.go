@@ -213,17 +213,29 @@ func (ringBuffer *LockingRingBuffer) GetBytesToOverwrite() int64 {
 // WaitForPosition blocks until the position becomes available, the buffer is
 // closed, EOF guarantees the position will never be written, or the context is
 // canceled. It returns true only if the position became available.
+//
+// A background goroutine is used to translate context cancellation into a
+// Broadcast wake-up. The goroutine is joined before WaitForPosition returns, so
+// there is no goroutine leak regardless of how frequently callers seek.
+// Joining is safe because the mutex is released before the join.
 func (ringBuffer *LockingRingBuffer) WaitForPosition(ctx context.Context, position int64) bool {
 	if ringBuffer.closed.Load() {
 		return false
 	}
 	ringBuffer.mu.Lock()
-	defer ringBuffer.mu.Unlock()
 	if ringBuffer.isPositionAvailableLocked(position) {
+		ringBuffer.mu.Unlock()
 		return true
 	}
+
+	// done is closed to signal the watcher goroutine to take the fast path.
+	// wg lets us join it after releasing the mutex so there is no deadlock and
+	// no goroutine leak.
 	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		select {
 		case <-ctx.Done():
 			ringBuffer.mu.Lock()
@@ -232,24 +244,31 @@ func (ringBuffer *LockingRingBuffer) WaitForPosition(ctx context.Context, positi
 		case <-done:
 		}
 	}()
-	defer close(done)
+
+	result := false
 	for !ringBuffer.closed.Load() && !ringBuffer.isPositionAvailableLocked(position) {
 		if ctx.Err() != nil {
-			return false
+			goto done
 		}
 		normalized := ringBuffer.getNormalizedPosition(position)
 		if normalized < ringBuffer.lastReadPosition {
-			return false
+			goto done
 		}
-		if ringBuffer.eof.Load() && normalized > ringBuffer.lastWritePosition {
-			return false
+		if ringBuffer.eof.Load() && normalized >= ringBuffer.lastWritePosition {
+			goto done
 		}
 		ringBuffer.available.Wait()
 	}
-	if ringBuffer.closed.Load() {
-		return false
+
+	if !ringBuffer.closed.Load() {
+		result = ringBuffer.isPositionAvailableLocked(position)
 	}
-	return ringBuffer.isPositionAvailableLocked(position)
+
+done:
+	ringBuffer.mu.Unlock()
+	close(done)
+	wg.Wait()
+	return result
 }
 
 // ResetToPosition clears the buffer and resets all internal cursors to start
@@ -324,8 +343,9 @@ func (ringBuffer *LockingRingBuffer) getBufferPosition(normalized int64) int64 {
 }
 
 // isPositionAvailableLocked reports whether the absolute position lies inside
-// the current readable window (inclusive at the upper boundary). Caller holds
-// ringBuffer.mu.
+// the current readable window [earliest, lastWritePosition). The upper bound is
+// exclusive: lastWritePosition is the offset one past the last written byte, so
+// the byte at that offset has not yet been written. Caller holds ringBuffer.mu.
 func (ringBuffer *LockingRingBuffer) isPositionAvailableLocked(position int64) bool {
 	if ringBuffer.count.Load() == 0 {
 		return false
@@ -335,5 +355,5 @@ func (ringBuffer *LockingRingBuffer) isPositionAvailableLocked(position int64) b
 		return false
 	}
 	earliest := ringBuffer.earliest()
-	return normalized >= earliest && normalized <= ringBuffer.lastWritePosition
+	return normalized >= earliest && normalized < ringBuffer.lastWritePosition
 }
